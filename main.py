@@ -1,13 +1,12 @@
 import os
-import re
 from dotenv import load_dotenv
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
 from langchain_ollama.chat_models import ChatOllama
 from langchain.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from pydantic.v1 import BaseModel, Field
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, List
+from typing import TypedDict, List, Optional
 import pypdf
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -21,9 +20,8 @@ langfuse = Langfuse(
     secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
     host=os.getenv("LANGFUSE_HOST"),
     )
-langfuse_callback_handler = CallbackHandler(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-    )
+
+langfuse_callback_handler = CallbackHandler()
 
 # --- 1. Data Ingestion ---
 def get_document_paths(data_dir="train"):
@@ -104,9 +102,18 @@ def load_documents(file_paths):
 
 # --- 2. LangGraph Agent Definition ---
 
+class DataReference(BaseModel):
+    """A single data reference found in a document."""
+    referenced_data: str = Field(description="The piece of text that references a dataset, data repository, or data usage.")
+    citation_name: Optional[str] = Field(description="The name of the citation or reference ID, if available.", default=None)
+
+class DataReferences(BaseModel):
+    """A list of data references found in the document."""
+    references: List[DataReference]
+
 class AgentState(TypedDict):
     document_content: str
-    data_references: List[str]
+    data_references: List[DataReference]
     document_id: str
 
 # Define the nodes for the graph
@@ -115,25 +122,32 @@ def identify_data_references_node(state: AgentState):
     Identifies datasets, repositories, and data mentions in the document.
     """
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert at identifying references to datasets, data repositories, or mentions of data usage in scientific papers. Your task is to extract any phrases or sentences that indicate the use of data. Look for names of datasets, URLs to data repositories, or descriptions of data collection and usage."),
+        ("system", """You are an expert at identifying references to datasets, data repositories, or mentions of data usage in scientific papers.
+Your task is to carefully read the document and extract phrases or sentences that explicitly mention the use of a dataset.
+
+A 'data reference' is the description of the dataset being used, for example, 'We used the ADNI dataset for our analysis.'
+A 'citation' is the bibliographic reference that might accompany the data reference, often in parentheses, like '(Mueller et al., 2005)'.
+
+Please extract pairs of (data reference, citation).
+- The `referenced_data` field should contain the text describing the data.
+- The `citation_name` field should contain the corresponding citation.
+
+Look for names of datasets, URLs to data repositories, or descriptions of data collection and usage. Only extract explicit mentions of data."""),
         ("user", "Please analyze the following document content and extract all data references:\n\n---\n\n{document_content}")
     ])
     
     llm = ChatOllama(model="llama3", temperature=0)
     
-    chain = prompt | llm | StrOutputParser()
+    structured_llm = llm.with_structured_output(DataReferences)
     
-    data_references_text = chain.invoke(
+    chain = prompt | structured_llm
+    
+    result = chain.invoke(
         {"document_content": state["document_content"]},
         config={"callbacks": [langfuse_callback_handler]}
     )
     
-    # Simple regex to split the response into a list of references.
-    # This might need refinement based on the LLM's output format.
-    references = re.split(r'\n\s*\d+\.\s*', data_references_text)
-    cleaned_references = [ref.strip() for ref in references if ref.strip()]
-    
-    return {"data_references": cleaned_references}
+    return {"data_references": result.references}
 
 # Define the graph
 def build_graph():
@@ -146,7 +160,7 @@ def build_graph():
 # --- 3. Main Execution Logic ---
 def main():
     print("Starting document processing...")
-    
+
     # 1. Load data
     document_paths = get_document_paths()
     documents = load_documents(document_paths)
