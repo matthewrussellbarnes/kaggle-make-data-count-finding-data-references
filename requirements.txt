@@ -1,0 +1,11 @@
+langgraph
+langfuse
+langchain
+langchain-openai
+pypdf
+python-dotenv
+lxml
+tqdm
+beautifulsoup4
+langchain-community
+langchain-ollama
