@@ -2,3 +2,4 @@
 *.pdf
 *.xml
 .env
+*.pkl

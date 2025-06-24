@@ -1,4 +1,5 @@
 import os
+import pickle
 from dotenv import load_dotenv
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
@@ -13,6 +14,7 @@ from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
+model = "llama4"
 
 # Langfuse integration
 langfuse = Langfuse(
@@ -129,7 +131,7 @@ def extract_data_references_node(state: AgentState):
     """
     Step 1: Extract data references as plain text from the document.
     """
-    llm = ChatOllama(model="llama3", temperature=0.0)
+    llm = ChatOllama(model=model, temperature=0.0)
     
     extraction_prompt = ChatPromptTemplate.from_messages([
         ("system", """You must find ONLY sentences about DATA COLLECTION, DATASET USAGE, or DATA REPOSITORIES. 
@@ -176,7 +178,7 @@ def structure_data_references_node(state: AgentState):
     if extracted_text.upper() == "NONE" or not extracted_text:
         return {"data_references": []}
     
-    llm = ChatOllama(model="llama3", temperature=0.0)
+    llm = ChatOllama(model=model, temperature=0.0)
     
     structuring_prompt = ChatPromptTemplate.from_messages([
         ("system", """Convert these data references into structured format. For each reference, create a DataReference object with:
@@ -202,7 +204,7 @@ def build_data_connections(all_results):
     if len(all_results) < 2:
         return []
     
-    llm = ChatOllama(model="llama3", temperature=0.0)
+    llm = ChatOllama(model=model, temperature=0.0)
     
     # Prepare data for comparison
     papers_data = []
@@ -285,8 +287,22 @@ def main():
     print("Starting document processing...")
 
     # 1. Load data
-    document_paths = get_document_paths()
-    documents = load_documents(document_paths)
+    pickle_file = "documents.pkl"
+    
+    if os.path.exists(pickle_file):
+        print(f"Loading documents from '{pickle_file}'...")
+        with open(pickle_file, "rb") as f:
+            documents = pickle.load(f)
+        print(f"Loaded {len(documents)} documents from pickle file")
+    else:
+        print("Pickle file not found. Loading documents from PDF/XML files...")
+        document_paths = get_document_paths()
+        documents = load_documents(document_paths)
+        
+        # Save documents to pickle file for future use
+        with open(pickle_file, "wb") as f:
+            pickle.dump(documents, f)
+        print(f"Saved {len(documents)} documents to '{pickle_file}'")
     
     # 2. Build the agent graph
     app = build_graph()
