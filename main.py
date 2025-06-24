@@ -80,7 +80,6 @@ def parse_xml(file_path):
         return {}
 
 def load_documents(file_paths):
-    file_paths = file_paths[:1]
     docs = []
     for paths in tqdm(file_paths, desc="Loading documents"):
         pdf_path = paths.get('pdf')
@@ -110,6 +109,14 @@ class DataReference(BaseModel):
 class DataReferences(BaseModel):
     """A list of data references found in the document."""
     references: List[DataReference]
+
+class DataConnection(BaseModel):
+    """A connection between data references across papers."""
+    paper1_id: str = Field(description="ID of the first paper")
+    paper2_id: str = Field(description="ID of the second paper")
+    shared_dataset: str = Field(description="Description of the shared dataset")
+    connection_type: str = Field(description="Type of connection: 'same_dataset', 'original_source', 'secondary_citation'")
+    confidence: float = Field(description="Confidence score 0-1")
 
 class AgentState(TypedDict):
     document_content: str
@@ -188,6 +195,79 @@ def structure_data_references_node(state: AgentState):
     
     return {"data_references": structuring_result.references}
 
+def build_data_connections(all_results):
+    """
+    Build connections between papers that reference the same datasets.
+    """
+    if len(all_results) < 2:
+        return []
+    
+    llm = ChatOllama(model="llama3", temperature=0.0)
+    
+    # Prepare data for comparison
+    papers_data = []
+    for result in all_results:
+        if result.get("references"):
+            papers_data.append({
+                "paper_id": result["id"],
+                "references": [ref.referenced_data for ref in result["references"]]
+            })
+    
+    if len(papers_data) < 2:
+        return []
+    
+    # Create prompt for finding connections
+    connection_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Analyze these data references from different papers and identify connections.
+
+TYPES OF CONNECTIONS:
+1. **same_dataset** - Different papers using the exact same dataset/database
+2. **original_source** - One paper cites the original source, another cites a secondary source
+3. **secondary_citation** - Papers cite different secondary sources of the same original data
+
+EXAMPLES:
+- "We used ImageNet dataset" + "Images from ImageNet database" = same_dataset
+- "Data from Smith et al. 2020" + "Original survey data collected by Smith" = original_source  
+- "GenBank sequences" + "NCBI nucleotide database" = same_dataset
+- "UK Biobank data" + "Data available from UK Biobank" = same_dataset
+
+For each connection found, provide:
+- paper1_id and paper2_id
+- shared_dataset: brief description of the shared data
+- connection_type: one of the three types above
+- confidence: 0.0-1.0 (1.0 = definitely same data, 0.5 = possibly related)
+
+Only include connections with confidence >= 0.6"""),
+        ("user", "Find connections between these papers' data references:\n\n{papers_data}")
+    ])
+    
+    # Format papers data for the prompt
+    papers_text = ""
+    for paper in papers_data:
+        papers_text += f"Paper ID: {paper['paper_id']}\n"
+        papers_text += "Data references:\n"
+        for ref in paper['references']:
+            papers_text += f"- {ref}\n"
+        papers_text += "\n"
+    
+    try:
+        class DataConnections(BaseModel):
+            connections: List[DataConnection]
+        
+        structured_llm = llm.with_structured_output(DataConnections)
+        connection_chain = connection_prompt | structured_llm
+        
+        result = connection_chain.invoke(
+            {"papers_data": papers_text},
+            config={"callbacks": [langfuse_callback_handler]}
+        )
+        
+        return result.connections
+        
+    except Exception as e:
+        print(f"Error building data connections: {e}")
+        return []
+
 # Define the graph
 def build_graph():
     workflow = StateGraph(AgentState)
@@ -213,11 +293,16 @@ def main():
     
     # 3. Process each document
     all_results = []
-    for doc in documents:
+    for doc in tqdm(documents, desc="Extracting data references"):
+
         inputs = {
-            "document_content": f"PDF Content:\n{doc['pdf_content']}\n\nXML Content:\n{doc['xml_content']}",
+            "document_content": "",
             "document_id": doc["id"]
         }
+        if 'pdf_content' in doc:
+            inputs["document_content"] += f"PDF Content:\n{doc['pdf_content']}\n\n"
+        if 'xml_content' in doc:
+            inputs["document_content"] += f"XML Content:\n{doc['xml_content']}\n\n"
         
         result = app.invoke(inputs, config={"callbacks": [langfuse_callback_handler]})
         
@@ -234,8 +319,72 @@ def main():
             "references": result.get("data_references", [])
         })
 
+    # 4. Build connections between data references
+    print("\n" + "="*50)
+    print("BUILDING DATA CONNECTIONS")
+    print("="*50)
+    
+    connections = build_data_connections(all_results)
+    
+    if connections:
+        print(f"\nFound {len(connections)} data connections:")
+        for conn in connections:
+            print(f"\n Connection ({conn.connection_type}, confidence: {conn.confidence:.2f})")
+            print(f"   Papers: {conn.paper1_id} ↔ {conn.paper2_id}")
+            print(f"   Shared dataset: {conn.shared_dataset}")
+    else:
+        print("\nNo data connections found between papers.")
+
+    # 5. Export data network for visualization
+    export_data_network(all_results, connections)
+    
     print("\nProcessing complete.")
     langfuse.flush() # Ensure all traces are sent
+
+def export_data_network(all_results, connections):
+    """Export the data citation network for visualization."""
+    import json
+    
+    # Create nodes (papers)
+    nodes = []
+    for result in all_results:
+        nodes.append({
+            "id": result["id"],
+            "label": result["id"],
+            "type": "paper",
+            "data_references_count": len(result.get("references", []))
+        })
+    
+    # Create edges (connections)
+    edges = []
+    for conn in connections:
+        edges.append({
+            "source": conn.paper1_id,
+            "target": conn.paper2_id,
+            "label": conn.shared_dataset,
+            "type": conn.connection_type,
+            "confidence": conn.confidence
+        })
+    
+    network_data = {
+        "nodes": nodes,
+        "edges": edges,
+        "metadata": {
+            "total_papers": len(nodes),
+            "total_connections": len(edges),
+            "connection_types": list(set([e["type"] for e in edges]))
+        }
+    }
+    
+    # Save to file
+    with open("data_citation_network.json", "w") as f:
+        json.dump(network_data, f, indent=2)
+    
+    print(f"\n Data citation network exported to 'data_citation_network.json'")
+    print(f"   - {len(nodes)} papers")
+    print(f"   - {len(edges)} connections")
+    
+    return network_data
 
 if __name__ == "__main__":
     main() 
