@@ -113,48 +113,91 @@ class DataReferences(BaseModel):
 
 class AgentState(TypedDict):
     document_content: str
+    extracted_references_text: str
     data_references: List[DataReference]
     document_id: str
 
 # Define the nodes for the graph
-def identify_data_references_node(state: AgentState):
+def extract_data_references_node(state: AgentState):
     """
-    Identifies datasets, repositories, and data mentions in the document.
+    Step 1: Extract data references as plain text from the document.
     """
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an expert at identifying references to datasets, data repositories, or mentions of data usage in scientific papers.
-Your task is to carefully read the document and extract phrases or sentences that explicitly mention the use of a dataset.
+    llm = ChatOllama(model="llama3", temperature=0.0)
+    
+    extraction_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You must find ONLY sentences about DATA COLLECTION, DATASET USAGE, or DATA REPOSITORIES. 
 
-A 'data reference' is the description of the dataset being used, for example, 'We used the ADNI dataset for our analysis.'
-A 'citation' is the bibliographic reference that might accompany the data reference, often in parentheses, like '(Mueller et al., 2005)'.
+CRITICAL RULE: If a sentence contains "et al." it is an AUTHOR CITATION - DO NOT EXTRACT IT.
 
-Please extract pairs of (data reference, citation).
-- The `referenced_data` field should contain the text describing the data.
-- The `citation_name` field should contain the corresponding citation.
+EXTRACT sentences that describe:
+✅ Data collection: "We collected...", "Data were gathered...", "Samples were obtained..."
+✅ Dataset usage: "We used the [dataset name]", "Data from [database/repository]"
+✅ Database access: "Downloaded from...", "Retrieved from...", "Accessed via..."  
+✅ Repository mentions: "Available at [URL]", "Deposited in [repository]"
+✅ Survey/experimental data: "Participants completed...", "Measurements were taken..."
 
-Look for names of datasets, URLs to data repositories, or descriptions of data collection and usage. Only extract explicit mentions of data."""),
-        ("user", "Please analyze the following document content and extract all data references:\n\n---\n\n{document_content}")
+NEVER EXTRACT (these are NOT data references):
+❌ Author citations: "[Author] et al. (year)" or "(Author, year)"
+❌ Funding organizations: grant agencies, foundations
+❌ Universities/institutions: research institutions, universities
+❌ Method references: "following [Author's] protocol"
+❌ General study references without data mention
+
+IMPORTANT: Focus on sentences that describe the ACTUAL COLLECTION, ACCESS, or USE of datasets/data, not citations to other research.
+
+List each data reference on a separate line. If none found, respond with "NONE"."""),
+        ("user", "Find sentences about DATA COLLECTION, DATASETS, or DATA REPOSITORIES. Skip author citations, funding, institutions.\n\nDocument:\n{document_content}")
     ])
     
-    llm = ChatOllama(model="llama3", temperature=0)
+    extraction_chain = extraction_prompt | llm
     
-    structured_llm = llm.with_structured_output(DataReferences)
-    
-    chain = prompt | structured_llm
-    
-    result = chain.invoke(
+    extraction_result = extraction_chain.invoke(
         {"document_content": state["document_content"]},
         config={"callbacks": [langfuse_callback_handler]}
     )
     
-    return {"data_references": result.references}
+    extracted_text = extraction_result.content.strip()
+    
+    return {"extracted_references_text": extracted_text}
+
+def structure_data_references_node(state: AgentState):
+    """
+    Step 2: Structure the extracted references into DataReference objects.
+    """
+    extracted_text = state["extracted_references_text"]
+    
+    if extracted_text.upper() == "NONE" or not extracted_text:
+        return {"data_references": []}
+    
+    llm = ChatOllama(model="llama3", temperature=0.0)
+    
+    structuring_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Convert these data references into structured format. For each reference, create a DataReference object with:
+- referenced_data: the complete sentence
+- citation_name: null (unless there's a specific dataset citation)"""),
+        ("user", "Convert these data references to structured format:\n\n{extracted_references}")
+    ])
+    
+    structured_llm = llm.with_structured_output(DataReferences)
+    structuring_chain = structuring_prompt | structured_llm
+    
+    structuring_result = structuring_chain.invoke(
+        {"extracted_references": extracted_text},
+        config={"callbacks": [langfuse_callback_handler]}
+    )
+    
+    return {"data_references": structuring_result.references}
 
 # Define the graph
 def build_graph():
     workflow = StateGraph(AgentState)
-    workflow.add_node("identify_data_references", identify_data_references_node)
-    workflow.set_entry_point("identify_data_references")
-    workflow.add_edge("identify_data_references", END)
+    workflow.add_node("extract_data_references", extract_data_references_node)
+    workflow.add_node("structure_data_references", structure_data_references_node)
+    
+    workflow.set_entry_point("extract_data_references")
+    workflow.add_edge("extract_data_references", "structure_data_references")
+    workflow.add_edge("structure_data_references", END)
+    
     return workflow.compile()
 
 # --- 3. Main Execution Logic ---
